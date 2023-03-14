@@ -1,26 +1,3 @@
-# Steps:
-# - Loop through sqlite "file" table in stratas
-# - For each strata:
-#   - Get list of database entries from sqlite "file"
-#   - Loop through file entries
-#       - Check if file already exists in remote MongoDB
-#       - For each file entry get "repo" information
-#       - For each file entry get list of commits from "comit"
-#       - Contruct JSON Object for one file
-#       - Upload file entry to MongoDB remote
-#   - Store strata information in file to continue script in case of error
-
-# We need:
-# Global current JSON Object
-# Global Loop over Strata
-# Functions to handle the data retrievel from sqlite
-# Functions to print output
-# Functions to handle request to MongoDB
-# Interrupt handler
-
-#  DIFFERENT STRATEGY:
-# Go through the repo table one by one and then select files
-
 #-------------------------------------------------------------------------------
 # MIT License
 #
@@ -48,14 +25,15 @@
 ############################  SQLITE TO MONGODB  #############################
 
 # This script is developed as a helper when working with the "github-file-scaper"
-# and the "Smart Contract Repository". The file scaper produces a local sqlite3
+# and the "Smart Contract Repository". The file-scaper produces a local sqlite3
 # database containing smart contracts and their meta data in three tables (file,
 # repo and comit). This script will transfer the data into a json-like format and
 # upload it to the remote MongoDB database of the "Smart Contract Repository"
 
 import os, sys, argparse, shutil, time, signal
 import sqlite3, csv
-import requests
+import requests, pymongo
+import json, re
 
 # First we parse the user arguments
 
@@ -69,11 +47,22 @@ parser = argparse.ArgumentParser(
 parser.add_argument('--database-path', metavar='FILE', default='results.db', 
     help='path to local sqlite3 database (default: results.db)')
 
-parser.add_argument('--statistics', metavar='FILE', default='sampling.csv', 
-    help='upload statistics file (default: sampling.csv)')
+# TODO: Implement statistics file??
+# (store repo_id or file (sha?) in statistics file for interrupted runs)
+# parser.add_argument('--statistics', metavar='FILE', default='sampling.csv', 
+#     help='upload statistics file (default: sampling.csv)')
 
 parser.add_argument('--remote-connection', metavar='STRING', default='mongodb://localhost:27017/', 
     help='connection string for target mongodb database (default: mongodb://localhost:27017/)')
+
+# The following two arguments are only needed if we want to double check licenses
+parser.add_argument('--check-repo-license', dest='checkLicenses', action='store_true', 
+    help='Use the GitHub API to double check for each repository if it has a license file. (default: False)')
+
+parser.add_argument('--github-token', metavar='TOKEN', 
+    default=os.environ.get('GITHUB_TOKEN'), 
+    help='''personal access token for GitHub 
+    (by default, the environment variable GITHUB_TOKEN is used)''')
 
 args = parser.parse_args()
 
@@ -82,21 +71,25 @@ if not os.path.isfile(args.database_path):
 
 #-------------------------------------------------------------------------------
 
-# We want to avoid to store the entire database content in a python variable therefore
-# we loop through the content of the "file" table and only select a few entries at the
-# time. We then handle these entries and when they are uploaded we continue to go through
-# the table.
+# Globally we store the current JSON Object that is constructed before it is uploaded to
+# the remote database.
+document = {}
 
-# Globalley we store the current JSON Object that is constructed before it is uploaded to
-# the remote database
-current = {}
+# We also keep track of the database elements that have been handled so far.
+repos_handled = 0
+repos_total = 0
+files_handled = 0
+files_total = 0
+commits_handled = 0
+commits_total = 0
 finished = 0
 
 # We keep track of the execution time and amount of requests of the script.
-
 start = time.time()
-post_requests = 0
+http_requests = 0
 
+# Let's also inform the user that the script is running.
+print(' > Starting the Script')
 
 #-------------------------------------------------------------------------------
 
@@ -107,15 +100,15 @@ status_msg = ''
 
 def print_summary():
     print()
-    print('Repositories handled: %d / %d ' % (0, 1))
-    print('Files handled: %d / %d ' % (0, 1))
-    print('Commits handled: %d / %d ' % (0, 1))
-    print('Uploaded Documents: %d' % (finished))
+    print(' > Repositories handled: %d / %d ' % (repos_handled, repos_total))
+    print(' > Files handled: %d / %d ' % (files_handled, files_total))
+    print(' > Commits handled: %d / %d ' % (commits_handled, commits_total))
+    print(' > Uploaded Documents: %d' % (finished))
     print()
     print(status_msg)
 
 def clear_footer():
-    sys.stdout.write(f'\033[9F\r\033[J')
+    sys.stdout.write(f'\033[7F\r\033[J')
 
 # For convenience, we also have function for just updating the status message.
 # It returns the old message so it can be restored later if desired.
@@ -130,28 +123,106 @@ def update_status(msg):
 
 #-------------------------------------------------------------------------------
 
-# We also need to establish a connection to the remote database.
+# This is a good place to try open the connection to the databases. First we 
+# connect to the local sqlite3 file that contains the smart contracts and afterwards
+# we connect to the remote MongoDB database. If an error occurs we exit the script.
+# Hint: 'commit' is a reserved keyword in sqlite, therefore the tablename is 'comit'.
 
-# TODO: GET MONGODB CONNECTION
+try:
+    print(' > Trying to connect to Sqlite3 database: "%s"' % args.database_path)
+    db = sqlite3.connect(args.database_path)
+except sqlite3.Error as e:
+    error_string = 'sqlite DB connection failed', str(e)
+    sys.exit(error_string)
 
-# We define a convienent function to upload data to the remote database
+dbcursor = db.cursor()
 
-def post(url, params={}):
-    global post_requests
+sys.stdout.write('\033[F\r\033[J')
+print(' > Successfully connected to Sqlite3 database: "%s"' % args.database_path)
+
+try:
+    print(' > Trying to connect to MongoDB database: "%s"' % args.remote_connection)
+    # client = MongoClient('mongodb://<username>:<password>@<host>:<port>/')
+    mongo_client = pymongo.MongoClient(args.remote_connection)
+    mongo_client.server_info() # check if connection is successful
+except pymongo.errors.ServerSelectionTimeoutError as e:
+    error_string = 'MongoDB connection failed', str(e)
+    sys.exit(error_string)
+
+mongo_db = mongo_client.main_db
+mongo_collection = mongo_db.contracts
+
+sys.stdout.write('\033[F\r\033[J')
+print(' > Successfully connected to MongoDB database: "%s"' % args.remote_connection)
+
+#-------------------------------------------------------------------------------
+
+# Before starting the loop over the database, let's see if we have a statistics 
+# file that we could use to continue a previous script run. If so, let's
+# get our data structures and UI up-to-date; otherwise, create a new statistics
+# file.
+
+# if os.path.isfile(args.statistics):
+#     # update_status('Continuing previous upload...')
+#     with open(args.statistics, 'r') as f:
+#         fr = csv.reader(f)
+#         next(fr) # skip header
+#         for row in fr:
+#             strat_first = int(row[0])
+#             # total_sam_comit += sam_comit
+#             clear_footer()
+#             print_summary()
+# else:
+#     with open(args.statistics, 'w') as f:
+#         f.write('stratum_first,stratum_last,population_file,sample_repo,sample_file,sample_comit\n')
+
+
+# statsfile = open(args.statistics, 'a', newline='')
+# stats = csv.writer(statsfile)
+
+#-------------------------------------------------------------------------------
+
+# Let's also quickly define a signal handler to cleanly deal with Ctrl-C. If the
+# user quits the program we want to be able continue more-or-less where we left of.
+# So we need to properly close the database connections and statistic file.
+
+def signal_handler(sig,frame):
+    db.commit()
+    db.close()
+    mongo_client.close()
+    print("\n > Script terminated by user.")
+    print(" > The program took " + time.strftime("%H:%M:%S", 
+        time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
+    print(" > The program has sent " + str(http_requests) + " requests.\n")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
+#-------------------------------------------------------------------------------
+
+# In order to handle Get request to the GitHub API we define a small helper function
+# and also a helping function that can handle request errors.
+
+def get(url, params={}):
+    global http_requests
+    # throttle github api
+    time.sleep(0.72)
     try:
-        res = requests.get(url, params)
+        res = requests.get(url, params, headers={'Authorization': f'token {args.github_token}'})
     except requests.ConnectionError:
         print("\nERROR :: There seems to be a problem with your internet connection.")
         return signal_handler(0,0)
-    post_requests += 1
+    http_requests += 1
     
-    if res.status_code != 200:
+    if res.status_code == 403:
+        return handle_rate_limit_error(res)
+    elif res.status_code != 200:
         res.raise_for_status()
-        return handle_error_code(res)
     else:
         return res
 
-def handle_error_code(res):
+def handle_rate_limit_error(res):
     t = res.headers.get('X-RateLimit-Reset')
     if t is not None:
         t = max(0, int(int(t) - time.time()))
@@ -163,80 +234,175 @@ def handle_error_code(res):
     old_msg = update_status(err_msg)
     time.sleep(t)
     update_status(old_msg)
-    return post(res.url)
+    return get(res.url)
 
 #-------------------------------------------------------------------------------
 
-# This is a good place to try open the connection to the local database.
-# 'commit' is a reserved keyword in sqlite, therefore the tablename is 'comit'.
+# Helper function to check if the license of the repository is open source.
 
-try:
-    db = sqlite3.connect(args.database_path)
-except sqlite3.Error as e:
-    error_string = 'sqlite DB connection failed', str(e)
-    sys.exit(error_string)
+def check_license(row):
+    licenses = ['apache-2.0', 'agpl-3.0', 'bsd-2-clause', 'bsd-3-clause', 'bsl-1.0',
+            'cc0-1.0', 'epl-2.0', 'gpl-2.0', 'gpl-3.0', 'lgpl-2.1', 'mit',
+            'mpl-2.0', 'unlicense']
+    # Send GET request to GitHub API to get the license
+    res = get('https://api.github.com/repos/' + row[2] + '/license')
+    if res.json()['license']['key'] in licenses:
+        return True
+    else:
+        return False
 
-dbcursor = db.cursor()
+# Helper function to get the compiler version from the content
 
+def get_compiler_version(content):
+    check_version = re.search(r'pragma solidity [<>^]?=?\s*([\d.]+)', content)
+    if (check_version):
+        return check_version.group(1)
+    else:
+        return None
+    
+    # ALTERNATIVE:
+    # compiler_version = ''
+    # for line in content.splitlines():
+    #     if line.startswith('pragma solidity'):
+    #         compiler_version = line.split(' ')[2]
+    #         break
+    # return compiler_version[:-1]
 
 #-------------------------------------------------------------------------------
 
 # Now we can finally get into it! 
 
 status_msg = 'Initialize Program'
+
+# Before we start we count the rows in the three tables and update the UI in order
+# to give the user an overview on how much data we are dealing with.
+
+dbcursor.execute("SELECT COUNT(1) FROM repo")
+repos_total = dbcursor.fetchone()[0]
+dbcursor.execute("SELECT COUNT(1) FROM file")
+files_total = dbcursor.fetchone()[0]
+dbcursor.execute("SELECT COUNT(1) FROM comit")
+commits_total = dbcursor.fetchone()[0]
+
 print_summary()
+time.sleep(0.5)
 
-# Before starting the iterative search process, let's see if we have a sampling
-# statistics file that we could use to continue a previous search. If so, let's
-# get our data structures and UI up-to-date; otherwise, create a new statistics
-# file.
+# In order to get the necessary data from the sqlite3 database and construct
+# the data object that we want to send to the remote database, we need to loop over
+# the repositories, files and commits. We start by getting a cursor on all 
+# the repositories in the sqlite3 file.
 
-if os.path.isfile(args.statistics):
-    update_status('Continuing previous upload...')
-    with open(args.statistics, 'r') as f:
-        fr = csv.reader(f)
-        next(fr) # skip header
-        for row in fr:
-            strat_first = int(row[0])
-            total_sam_comit += sam_comit
-            clear_footer()
-            print_summary()
-else:
-    with open(args.statistics, 'w') as f:
-        f.write('stratum_first,stratum_last,population_file,sample_repo,sample_file,sample_comit\n')
+repocursor = db.cursor()
+repocursor.execute("SELECT * FROM repo")
 
+# We iterate over the rows using the cursor directly and not fetchall() to avoid loading
+# all rows into the ram at once. This is especially important if the database is large.
+# The cursor is consumed during this iteration, so we can't use it again later.
 
-statsfile = open(args.statistics, 'a', newline='')
-stats = csv.writer(statsfile)
+# TODO: It is probably safer to only get specific columns from the database instead of 
+# using the start (*) operator. Then we can call the columns by name instead of by index.
+# This would also make the code more readable. It can be done for the repo and file table.
 
-#-------------------------------------------------------------------------------
+for row in repocursor:
+    # repo_id is row[0]
+    # repo name is row[1]
+    # ...
 
-# Let's also quickly define a signal handler to cleanly deal with Ctrl-C. If the
-# user quits the program and cancels the search, we want to allow him to later
-# continue more-or-less where he left of. So we need to properly close the
-# database and statistic file.
+    # For each repository we first check the license again to assure that it is 
+    # open source.
+    if args.checkLicenses and not check_license(row):
+        print(' > License missing for: %s' % row[2])
+        continue
 
-def signal_handler(sig,frame):
-    db.commit()
-    db.close()
-    statsfile.flush()
-    statsfile.close()
-    print("\nThe program took " + time.strftime("%H:%M:%S", 
-        time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
-    print("The program has sent " + str(post_requests) + "requests to remote.\n\n")
-    sys.exit(0)
+    # Each row represents a repository. Hence we select all files from this repository
+    # from the files table and store them in a list. We can now iterate over the files,
+    # get the corrosponding commits from the comit table and construct the data object
+    # that should be uploaded to the mongodb database.
 
-signal.signal(signal.SIGINT, signal_handler)
+    dbcursor.execute("SELECT * FROM file WHERE repo_id = ?", (row[0],))
+    files = dbcursor.fetchall()
 
+    for file in files:
 
-#-------------------------------------------------------------------------------
+        update_status('Processing file: "%s" from "%s"' % (file[2], row[2]))
 
-# TODO: MAIN LOOP
+        document = {
+            # "_id": { "$oid": "63f64e1cd56ad6d1d7c1a887" },
+            "name": file[1],
+            "path": file[2],
+            "sha": file[3],
+            "language": "Solidity",
+            "license": "",
+            "repo": {
+                "repo_id": row[0],
+                "full_name": row[2],
+                "description": row[3],
+                "url": row[4],
+                "owner_id": row[6]
+            },
+            "versions": []
+        }
+        
+        dbcursor.execute('''SELECT sha, message, size, created, content, parents
+            FROM comit WHERE file_id = ? ORDER BY created''', (file[0],))
 
+        # We loop over the commits and add them to the data object.
+        vid = 0
+        for sha, message, size, created, content, parents in dbcursor.fetchall():
+            document['versions'].append({
+                "version_id": vid,
+                "sha": sha,
+                "message": message,
+                "size": size,
+                "created": created,
+                "compiler_version": get_compiler_version(content),
+                "content": content,
+                "parents": parents
+            })
+            vid += 1
+            commits_handled += 1
 
+        files_handled += 1
 
+        # TODO: Remove test print
+        # pretty = json.dumps(document, indent=4)
+        # print()
+        # print(pretty)
+        # print()
+        # print()
+        # print()
+        # print()
+        # print()
+        # print()
+        # print()
+
+        # TODO: Check if mongo object already exists in database -> object id / file sha?
+
+        # TODO: Upload to mongodb
+        # We then send the data to the remote database.
+        # post_response = requests.post(args.remote_connection, data=data)
+        #   OR
+        # Insert into mongo collection
+        # inserted = mongo_collection.insert_one(data).inserted_id
+        # if not inserted:
+        #     update_status('ERROR :: Inserting "%s" into MongoDB failed' % file[1])
+
+        finished += 1
+        document = {}
+        clear_footer()
+        print_summary()
+
+    repos_handled += 1
+    clear_footer()
+    print_summary()
+    
+
+# In the end we close the connections the database and the statistics file.
+db.commit()
+db.close()
+mongo_client.close()
 
 update_status('Done.')
-print("The program took " + time.strftime("%H:%M:%S", time.gmtime((time.time())-start)) + 
+print("\n > The program took " + time.strftime("%H:%M:%S", time.gmtime((time.time())-start)) + 
     " to execute (Hours:Minutes:Seconds).")
-print("The program has sent " + str(post_requests) + "requests to remote.\n\n")
+print(" > The program has sent " + str(http_requests) + " requests.\n")
