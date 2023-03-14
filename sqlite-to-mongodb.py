@@ -82,6 +82,7 @@ files_handled = 0
 files_total = 0
 commits_handled = 0
 commits_total = 0
+duplicate_files = 0
 finished = 0
 
 # We keep track of the execution time and amount of requests of the script.
@@ -104,11 +105,12 @@ def print_summary():
     print(' > Files handled: %d / %d ' % (files_handled, files_total))
     print(' > Commits handled: %d / %d ' % (commits_handled, commits_total))
     print(' > Uploaded Documents: %d' % (finished))
+    print(' > Duplicate Files: %d' % (duplicate_files))
     print()
     print(status_msg)
 
 def clear_footer():
-    sys.stdout.write(f'\033[7F\r\033[J')
+    sys.stdout.write(f'\033[8F\r\033[J')
 
 # For convenience, we also have function for just updating the status message.
 # It returns the old message so it can be restored later if desired.
@@ -347,6 +349,7 @@ for row in repocursor:
             FROM comit WHERE file_id = ? ORDER BY created''', (file[0],))
 
         # We loop over the commits and add them to the data object.
+        
         vid = 0
         for sha, message, size, created, content, parents in dbcursor.fetchall():
             document['versions'].append({
@@ -364,28 +367,25 @@ for row in repocursor:
 
         files_handled += 1
 
-        # TODO: Remove test print
-        # pretty = json.dumps(document, indent=4)
-        # print()
-        # print(pretty)
-        # print()
-        # print()
-        # print()
-        # print()
-        # print()
-        # print()
-        # print()
+        # Before we upload the data to the remote database we need to check if the file is already
+        # in the database to avoid duplicates.
+        # Usually the file sha uniquely identifies the file. However, if forks are included in 
+        # the database, the same file sha can exist for different files. Therefore uniqueness
+        # can only be guaranteed if the repo_id and the file sha are combined.
+        
+        duplicate = mongo_collection.find_one({"repo.repo_id": row[0], "sha": file[3]})
+        if duplicate:
+            duplicate_files += 1
+            update_status('File "%s" already exists in MongoDB' % file[1])
+            continue
 
-        # TODO: Check if mongo object already exists in database -> object id / file sha?
+        # As a final step we use pymongo to insert the data object into the remote database.
+        # We check if the insertion was successful and if not we print an error message.
+        # Afterwards we update the UI to show the user that a file has been processed.
 
-        # TODO: Upload to mongodb
-        # We then send the data to the remote database.
-        # post_response = requests.post(args.remote_connection, data=data)
-        #   OR
-        # Insert into mongo collection
-        # inserted = mongo_collection.insert_one(data).inserted_id
-        # if not inserted:
-        #     update_status('ERROR :: Inserting "%s" into MongoDB failed' % file[1])
+        inserted = mongo_collection.insert_one(document).inserted_id
+        if not inserted:
+            update_status('ERROR :: Inserting "%s" into MongoDB failed' % file[1])
 
         finished += 1
         document = {}
@@ -395,7 +395,6 @@ for row in repocursor:
     repos_handled += 1
     clear_footer()
     print_summary()
-    
 
 # In the end we close the connections the database and the statistics file.
 db.commit()
