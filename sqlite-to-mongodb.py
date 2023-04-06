@@ -314,18 +314,17 @@ for row in repocursor:
     # get the corrosponding commits from the comit table and construct the data object
     # that should be uploaded to the mongodb database.
 
-    dbcursor.execute("SELECT * FROM file WHERE repo_id = ?", (row[0],))
-    files = dbcursor.fetchall()
+    dbcursor.execute("SELECT file_id, name, path, sha FROM file WHERE repo_id = ?", (row[0],))
 
-    for file in files:
+    for file_id, f_name, f_path, f_sha in dbcursor.fetchall():
 
-        update_status('Processing file: "%s" from "%s"' % (file[2], row[2]))
+        update_status('Processing file: "%s" from "%s"' % (f_path, row[2]))
 
         document = {
             # "_id": { "$oid": "63f64e1cd56ad6d1d7c1a887" },
-            "name": file[1],
-            "path": file[2],
-            "sha": file[3],
+            "name": f_name,
+            "path": f_path,
+            "sha": f_sha,
             "language": "Solidity",
             "license": license,
             "repo": {
@@ -339,21 +338,21 @@ for row in repocursor:
         }
         
         dbcursor.execute('''SELECT sha, message, size, created, content, parents
-            FROM comit WHERE file_id = ? ORDER BY created''', (file[0],))
+            FROM comit WHERE file_id = ? ORDER BY created''', (file_id,))
 
         # We loop over the commits and add them to the data object.
 
         vid = 0
-        for sha, message, size, created, content, parents in dbcursor.fetchall():
+        for v_sha, v_message, v_size, v_created, v_content, v_parents in dbcursor.fetchall():
             document['versions'].append({
                 "version_id": vid,
-                "sha": sha,
-                "message": message,
-                "size": size,
-                "created": created,
-                "compiler_version": get_compiler_version(content),
-                "content": content,
-                "parents": parents
+                "sha": v_sha,
+                "message": v_message,
+                "size": v_size,
+                "created": v_created,
+                "compiler_version": get_compiler_version(v_content),
+                "content": v_content,
+                "parents": v_parents
             })
             vid += 1
             commits_handled += 1
@@ -364,7 +363,7 @@ for row in repocursor:
         # versions. If not, we skip it and continue with the next file.
 
         if not document['versions']:
-            update_status('File "%s" has no versions' % file[1])
+            update_status('File "%s" has no versions' % f_path)
             continue
 
         # Before we upload the data to the remote database we need to check if the file is already
@@ -373,10 +372,10 @@ for row in repocursor:
         # the database, the same file sha can exist for different files. Therefore uniqueness
         # can only be guaranteed if the repo_id and the file sha are combined.
         
-        duplicate = mongo_collection.find_one({"repo.repo_id": row[0], "sha": file[3]})
+        duplicate = mongo_collection.find_one({"repo.repo_id": row[0], "sha": f_sha})
         if duplicate:
             duplicate_files += 1
-            update_status('File "%s" already exists in MongoDB' % file[1])
+            update_status('File "%s" already exists in MongoDB' % f_path)
             continue
 
         # As a final step we use pymongo to insert the data object into the remote database.
@@ -385,7 +384,7 @@ for row in repocursor:
 
         inserted = mongo_collection.insert_one(document).inserted_id
         if not inserted:
-            update_status('ERROR :: Inserting "%s" into MongoDB failed' % file[1])
+            update_status('ERROR :: Inserting "%s" into MongoDB failed' % f_path)
             time.sleep(1)
 
         finished += 1
