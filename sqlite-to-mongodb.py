@@ -47,33 +47,46 @@ parser = argparse.ArgumentParser(
 parser.add_argument('--database-path', metavar='FILE', default='results.db', 
     help='path to local sqlite3 database (default: results.db)')
 
-# TODO: Implement statistics file??
-# (store repo_id or file (sha?) in statistics file for interrupted runs)
-# parser.add_argument('--statistics', metavar='FILE', default='sampling.csv', 
-#     help='upload statistics file (default: sampling.csv)')
-
 parser.add_argument('--remote-connection', metavar='STRING', default='mongodb://localhost:27017/', 
     help='connection string for target mongodb database (default: mongodb://localhost:27017/)')
 
-# The following two arguments are only needed if we want to double check licenses
+# We give the user to option to only upload repositories that have a license file.
+
 parser.add_argument('--check-repo-license', dest='checkLicenses', action='store_true', 
     help='Use the GitHub API to double check for each repository if it has a license file. (default: False)')
 
 parser.add_argument('--github-token', metavar='TOKEN', 
     default=os.environ.get('GITHUB_TOKEN'), 
     help='''personal access token for GitHub 
-    (by default, the environment variable GITHUB_TOKEN is used)''')
+(by default, the environment variable GITHUB_TOKEN is used)''')
 
 args = parser.parse_args()
 
 if not os.path.isfile(args.database_path):
     sys.exit('database file was not found')
 
+# We check if the user wants to double check the licenses of the repositories and 
+# if so ask for a github token.
+
+github_token = None
+
+if args.checkLicenses:
+    github_token = args.github_token
+    if not github_token:
+        input_github_token = input(''' > In order to check the licenses of the repositories
+(before uploading them) please provide a GitHub Access Token:\n''')
+        if not input_github_token:
+            sys.exit('''Without a GitHub Token you cannot check the licenses.
+You can still run the script without the license check.''')
+        else:
+            github_token = input_github_token
+
 #-------------------------------------------------------------------------------
 
 # Globally we store the current JSON Object that is constructed before it is uploaded to
 # the remote database.
 document = {}
+license = ""
 
 # We also keep track of the database elements that have been handled so far.
 repos_handled = 0
@@ -159,31 +172,6 @@ print(' > Successfully connected to MongoDB database: "%s"' % args.remote_connec
 
 #-------------------------------------------------------------------------------
 
-# Before starting the loop over the database, let's see if we have a statistics 
-# file that we could use to continue a previous script run. If so, let's
-# get our data structures and UI up-to-date; otherwise, create a new statistics
-# file.
-
-# if os.path.isfile(args.statistics):
-#     # update_status('Continuing previous upload...')
-#     with open(args.statistics, 'r') as f:
-#         fr = csv.reader(f)
-#         next(fr) # skip header
-#         for row in fr:
-#             strat_first = int(row[0])
-#             # total_sam_comit += sam_comit
-#             clear_footer()
-#             print_summary()
-# else:
-#     with open(args.statistics, 'w') as f:
-#         f.write('stratum_first,stratum_last,population_file,sample_repo,sample_file,sample_comit\n')
-
-
-# statsfile = open(args.statistics, 'a', newline='')
-# stats = csv.writer(statsfile)
-
-#-------------------------------------------------------------------------------
-
 # Let's also quickly define a signal handler to cleanly deal with Ctrl-C. If the
 # user quits the program we want to be able continue more-or-less where we left of.
 # So we need to properly close the database connections and statistic file.
@@ -204,19 +192,18 @@ signal.signal(signal.SIGINT, signal_handler)
 #-------------------------------------------------------------------------------
 
 # In order to handle Get request to the GitHub API we define a small helper function
-# and also a helping function that can handle request errors.
+# and also a helping function that can handle request throttling if we run into the
+# rate limit of the GitHub API.
 
 def get(url, params={}):
     global http_requests
-    # throttle github api
-    time.sleep(0.72)
+    time.sleep(0.72) # throttle github api
     try:
-        res = requests.get(url, params, headers={'Authorization': f'token {args.github_token}'})
+        res = requests.get(url, params, headers={'Authorization': f'token {github_token}'})
     except requests.ConnectionError:
         print("\nERROR :: There seems to be a problem with your internet connection.")
         return signal_handler(0,0)
     http_requests += 1
-    
     if res.status_code == 403:
         return handle_rate_limit_error(res)
     elif res.status_code != 200:
@@ -231,8 +218,6 @@ def handle_rate_limit_error(res):
     else: 
         t = int(res.headers.get('Retry-After', 60))
     err_msg = f'Exceeded rate limit. Retrying after {t} seconds...'
-    if not args.github_token:
-        err_msg += ' Try running the script with a GitHub TOKEN.'
     old_msg = update_status(err_msg)
     time.sleep(t)
     update_status(old_msg)
@@ -240,20 +225,27 @@ def handle_rate_limit_error(res):
 
 #-------------------------------------------------------------------------------
 
-# Helper function to check if the license of the repository is open source.
+# With this helper function we can check if a repository has a license that we can use.
+# We call the GitHub api for each repository and check if the license exists and if it
+# is in the list of hardcoded open source licenses.
+# This step is only necessary if the argument --check-repo-license is set to True.
+# We do not use the '/license' endpoint of GitHub because it returns a status 404 if the 
+# repository does not have a license.
 
 def check_license(row):
     licenses = ['apache-2.0', 'agpl-3.0', 'bsd-2-clause', 'bsd-3-clause', 'bsl-1.0',
             'cc0-1.0', 'epl-2.0', 'gpl-2.0', 'gpl-3.0', 'lgpl-2.1', 'mit',
             'mpl-2.0', 'unlicense']
-    # Send GET request to GitHub API to get the license
-    res = get('https://api.github.com/repos/' + row[2] + '/license')
-    if res.json()['license']['key'] in licenses:
+    res = get('https://api.github.com/repos/' + row[2] + '')
+    if res.json()['license'] and res.json()['license']['key'] and res.json()['license']['key'] in licenses:
+        global license
+        license = res.json()['license']['key']
         return True
     else:
         return False
 
-# Helper function to get the compiler version from the content
+# This is a helper function that we use to extract the compiler version from the
+# source code of a Solidity file. We use a regular expression to extract the version.
 
 def get_compiler_version(content):
     check_version = re.search(r'pragma solidity [<>^]?=?\s*([\d.]+)', content)
@@ -261,7 +253,6 @@ def get_compiler_version(content):
         return check_version.group(1)
     else:
         return None
-    
     # ALTERNATIVE:
     # compiler_version = ''
     # for line in content.splitlines():
@@ -311,9 +302,11 @@ for row in repocursor:
     # ...
 
     # For each repository we first check the license again to assure that it is 
-    # open source.
+    # open source. If the license is not open source we skip the repository.
+
     if args.checkLicenses and not check_license(row):
-        print(' > License missing for: %s' % row[2])
+        update_status('Missing License for: %s' % row[2])
+        repos_handled += 1
         continue
 
     # Each row represents a repository. Hence we select all files from this repository
@@ -334,7 +327,7 @@ for row in repocursor:
             "path": file[2],
             "sha": file[3],
             "language": "Solidity",
-            "license": "",
+            "license": license,
             "repo": {
                 "repo_id": row[0],
                 "full_name": row[2],
@@ -349,7 +342,7 @@ for row in repocursor:
             FROM comit WHERE file_id = ? ORDER BY created''', (file[0],))
 
         # We loop over the commits and add them to the data object.
-        
+
         vid = 0
         for sha, message, size, created, content, parents in dbcursor.fetchall():
             document['versions'].append({
@@ -366,6 +359,13 @@ for row in repocursor:
             commits_handled += 1
 
         files_handled += 1
+
+        # In order to avoid documents with no versions, we check if the document has any
+        # versions. If not, we skip it and continue with the next file.
+
+        if not document['versions']:
+            update_status('File "%s" has no versions' % file[1])
+            continue
 
         # Before we upload the data to the remote database we need to check if the file is already
         # in the database to avoid duplicates.
@@ -386,9 +386,11 @@ for row in repocursor:
         inserted = mongo_collection.insert_one(document).inserted_id
         if not inserted:
             update_status('ERROR :: Inserting "%s" into MongoDB failed' % file[1])
+            time.sleep(1)
 
         finished += 1
         document = {}
+        license = ""
         clear_footer()
         print_summary()
 
