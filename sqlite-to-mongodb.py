@@ -389,10 +389,10 @@ for row in repocursor:
 
         finished += 1
         document = {}
-        license = ""
         clear_footer()
         print_summary()
 
+    license = ""
     repos_handled += 1
     clear_footer()
     print_summary()
