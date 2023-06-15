@@ -207,7 +207,7 @@ def get(url, params={}):
     if res.status_code == 403:
         return handle_rate_limit_error(res)
     elif res.status_code != 200:
-        res.raise_for_status()
+        return 0 #res.raise_for_status()
     else:
         return res
 
@@ -237,7 +237,9 @@ def check_license(row):
             'cc0-1.0', 'epl-2.0', 'gpl-2.0', 'gpl-3.0', 'lgpl-2.1', 'mit',
             'mpl-2.0', 'unlicense']
     res = get('https://api.github.com/repos/' + row[2] + '')
-    if res.json()['license'] and res.json()['license']['key'] and res.json()['license']['key'] in licenses:
+    if res == 0:
+        return False
+    elif res.json()['license'] and res.json()['license']['key'] and res.json()['license']['key'] in licenses:
         global license
         license = res.json()['license']['key']
         return True
