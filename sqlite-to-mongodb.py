@@ -261,6 +261,14 @@ def get_compiler_version(content):
     #         break
     # return compiler_version[:-1]
 
+# We have another helper function that can check if a file is a json file.
+# Due to an error in the scraper some wrong .json files were downloaded.
+def check_file_extension(path):
+    if path.endswith('.json'):
+        return True
+    else:
+        return False
+
 #-------------------------------------------------------------------------------
 
 # Now we can finally get into it! 
@@ -319,6 +327,14 @@ for row in repocursor:
     for file_id, f_name, f_path, f_sha in dbcursor.fetchall():
 
         update_status('Processing file: "%s" from "%s"' % (f_path, row[2]))
+
+        # The crawler has a bug that sometimes adds a file to the database that include a
+        # .sol in the name but that are actually .json files and not Solidity files. We want
+        # to skip these files.
+        if check_file_extension(f_path):
+            update_status('Skipping file: "%s" from "%s" because its JSON' % (f_path, row[2]))
+            time.sleep(5)
+            continue
 
         document = {
             # "_id": { "$oid": "63f64e1cd56ad6d1d7c1a887" },
