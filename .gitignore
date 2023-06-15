@@ -1,3 +1,8 @@
+# Data files
+*.db
+*.json
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
