@@ -232,11 +232,11 @@ def handle_rate_limit_error(res):
 # We do not use the '/license' endpoint of GitHub because it returns a status 404 if the 
 # repository does not have a license.
 
-def check_license(row):
+def check_license(repo_full_name):
     licenses = ['apache-2.0', 'agpl-3.0', 'bsd-2-clause', 'bsd-3-clause', 'bsl-1.0',
             'cc0-1.0', 'epl-2.0', 'gpl-2.0', 'gpl-3.0', 'lgpl-2.1', 'mit',
             'mpl-2.0', 'unlicense']
-    res = get('https://api.github.com/repos/' + row[2] + '')
+    res = get('https://api.github.com/repos/' + str(repo_full_name) + '')
     if res.json()['license'] and res.json()['license']['key'] and res.json()['license']['key'] in licenses:
         global license
         license = res.json()['license']['key']
@@ -294,26 +294,21 @@ time.sleep(0.5)
 # the repositories in the sqlite3 file.
 
 repocursor = db.cursor()
-repocursor.execute("SELECT * FROM repo")
+# repocursor.execute("SELECT * FROM repo")
+repocursor.execute("SELECT repo_id, name, full_name, description, url, owner_id FROM repo")
 
 # We iterate over the rows using the cursor directly and not fetchall() to avoid loading
 # all rows into the ram at once. This is especially important if the database is large.
 # The cursor is consumed during this iteration, so we can't use it again later.
 
-# TODO: It is probably safer to only get specific columns from the database instead of 
-# using the start (*) operator. Then we can call the columns by name instead of by index.
-# This would also make the code more readable. It can be done for the repo and file table.
-
-for row in repocursor:
-    # repo_id is row[0]
-    # repo name is row[1]
-    # ...
-
+# for row in repocursor: <- old version only for specified col layout. Calling col names explicitly now.
+for repo_id, name, full_name, description, url, owner_id in repocursor:
+    
     # For each repository we first check the license again to assure that it is 
     # open source. If the license is not open source we skip the repository.
 
-    if args.checkLicenses and not check_license(row):
-        update_status('Missing License for: %s' % row[2])
+    if args.checkLicenses and not check_license(full_name):
+        update_status('Missing License for: %s' % full_name)
         repos_handled += 1
         continue
 
@@ -322,17 +317,17 @@ for row in repocursor:
     # get the corrosponding commits from the comit table and construct the data object
     # that should be uploaded to the mongodb database.
 
-    dbcursor.execute("SELECT file_id, name, path, sha FROM file WHERE repo_id = ?", (row[0],))
+    dbcursor.execute("SELECT file_id, name, path, sha FROM file WHERE repo_id = ?", (repo_id,))
 
     for file_id, f_name, f_path, f_sha in dbcursor.fetchall():
 
-        update_status('Processing file: "%s" from "%s"' % (f_path, row[2]))
+        update_status('Processing file: "%s" from "%s"' % (f_path, full_name))
 
         # The crawler has a bug that sometimes adds a file to the database that include a
         # .sol in the name but that are actually .json files and not Solidity files. We want
         # to skip these files.
         if check_file_extension(f_path):
-            update_status('Skipping file: "%s" from "%s" because its JSON' % (f_path, row[2]))
+            update_status('Skipping file: "%s" from "%s" because its JSON' % (f_path, full_name))
             time.sleep(5)
             continue
 
@@ -344,11 +339,11 @@ for row in repocursor:
             "language": "Solidity",
             "license": license,
             "repo": {
-                "repo_id": row[0],
-                "full_name": row[2],
-                "description": row[3],
-                "url": row[4],
-                "owner_id": row[6]
+                "repo_id": repo_id,
+                "full_name": full_name,
+                "description": description,
+                "url": url,
+                "owner_id": owner_id
             },
             "versions": []
         }
@@ -388,7 +383,7 @@ for row in repocursor:
         # the database, the same file sha can exist for different files. Therefore uniqueness
         # can only be guaranteed if the repo_id and the file sha are combined.
         
-        duplicate = mongo_collection.find_one({"repo.repo_id": row[0], "sha": f_sha})
+        duplicate = mongo_collection.find_one({"repo.repo_id": repo_id, "sha": f_sha})
         if duplicate:
             duplicate_files += 1
             update_status('File "%s" already exists in MongoDB' % f_path)
